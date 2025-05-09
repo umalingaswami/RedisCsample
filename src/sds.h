@@ -17,6 +17,7 @@ extern const char *SDS_NOINIT;
 #include <sys/types.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include "config.h"
 
 typedef char *sds;
 
@@ -61,6 +62,8 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 #define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T)));
 #define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))
 #define SDS_TYPE_5_LEN(f) ((f)>>SDS_TYPE_BITS)
+/* Prefetch based on the SDS type, into all cache levels (L1, L2, etc.). */
+#define SDS_HDR_PREFETCH(T, s) redis_prefetch_read((const char *)((s) - sizeof(struct sdshdr##T)))
 
 static inline size_t sdslen(const sds s) {
     unsigned char flags = s[-1];
@@ -68,12 +71,16 @@ static inline size_t sdslen(const sds s) {
         case SDS_TYPE_5:
             return SDS_TYPE_5_LEN(flags);
         case SDS_TYPE_8:
+            // SDS_HDR_PREFETCH(8,s);
             return SDS_HDR(8,s)->len;
         case SDS_TYPE_16:
+            // SDS_HDR_PREFETCH(16,s);
             return SDS_HDR(16,s)->len;
         case SDS_TYPE_32:
+            // SDS_HDR_PREFETCH(32,s);
             return SDS_HDR(32,s)->len;
         case SDS_TYPE_64:
+            // SDS_HDR_PREFETCH(64,s);
             return SDS_HDR(64,s)->len;
     }
     return 0;

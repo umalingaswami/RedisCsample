@@ -310,7 +310,6 @@ int getGenericCommand(client *c) {
     if (checkType(c,o,OBJ_STRING)) {
         return C_ERR;
     }
-
     addReplyBulk(c,o);
     return C_OK;
 }
