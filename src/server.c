@@ -4403,7 +4403,7 @@ int processCommand(client *c) {
 /* Checks if all keys in a command (or a MULTI-EXEC) belong to the same hash slot.
  * If yes, return 1, otherwise 0. If hashslot is not NULL, it will be set to the
  * slot of the keys. */
-int areCommandKeysInSameSlot(client *c, int *hashslot) {
+int areCommandKeysInSameSlot(client *c, int16_t *hashslot) {
     int slot = -1;
     multiState *ms = NULL;
 

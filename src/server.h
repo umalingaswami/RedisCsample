@@ -1313,57 +1313,69 @@ typedef struct {
 } clientReqResInfo;
 #endif
 
-typedef struct client {
-    uint64_t id;            /* Client incremental unique ID. */
+typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) client {
     uint64_t flags;         /* Client flags: CLIENT_* macros. */
-    connection *conn;
-    uint8_t tid;            /* Thread assigned ID this client is bound to. */
-    uint8_t running_tid;    /* Thread assigned ID this client is running on. */
+    listNode clients_pending_write_node; /* list node in clients_pending_write list.
+                                            accessed together with flags field */
+    sds querybuf;           /* Buffer we use to accumulate client queries. */
+    size_t qb_pos;          /* The position we have read in querybuf. */
+    int bufpos;
+
+    uint8_t resp;           /* RESP protocol version. Can be 2 or 3. */
+    uint8_t authenticated;  /* Needed when the default user requires auth. */
+    uint8_t replstate;      /* Replication state if this is a slave. */
+    uint8_t reqtype;            /* Request protocol type: PROTO_REQ_* */
+    long bulklen;           /* Length of bulk argument in multi bulk request. */
+
+    /* Response buffer */
+    size_t buf_peak; /* Peak used size of buffer in last 5 sec interval. */
+    long duration;          /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
+    struct redisCommand *realcmd; /* The original command that was executed by the client,
+                                     Used to update error stats in case the c->cmd was modified
+                                     during the command invocation (like on GEOADD for example). */
+    struct redisCommand *iolookedcmd;    /* Command looked up in IO threads. */
+    int argc;               /* Num of arguments of current command. */
+    int multibulklen;       /* Number of multi bulk arguments left to read. */
+    size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
+    time_t obuf_soft_limit_reached_time;
     uint8_t io_flags;       /* Accessed by both main and IO threads, but not modified concurrently */
     uint8_t read_error;     /* Client read error: CLIENT_READ_* macros. */
-    int resp;               /* RESP protocol version. Can be 2 or 3. */
+    int16_t slot;           /* The slot the client is executing against. Set to -1 if no slot is being used */
+    int16_t cluster_compatibility_check_slot; /* The slot the client is executing against for cluster compatibility check.
+    * -2 means we don't need to check slot violation, or we already found
+    * a violation, reported it and don't need to continue checking.
+    * -1 means we're looking for the slot number and didn't find it yet.
+    * any positive number means we found a slot and no violation yet. */
+    uint8_t tid;            /* Thread assigned ID this client is bound to. */
+    uint8_t running_tid;    /* Thread assigned ID this client is running on. */
+
+
     redisDb *db;            /* Pointer to currently SELECTed DB. */
     robj *name;             /* As set by CLIENT SETNAME. */
     robj *lib_name;         /* The client library name as set by CLIENT SETINFO. */
     robj *lib_ver;          /* The client library version as set by CLIENT SETINFO. */
-    sds querybuf;           /* Buffer we use to accumulate client queries. */
-    size_t qb_pos;          /* The position we have read in querybuf. */
     size_t querybuf_peak;   /* Recent (100ms or more) peak of querybuf size. */
-    int argc;               /* Num of arguments of current command. */
     robj **argv;            /* Arguments of current command. */
-    int argv_len;           /* Size of argv array (may be more than argc) */
-    int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
-    robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
-    size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
     struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
-    struct redisCommand *iolookedcmd;    /* Command looked up in IO threads. */
-    struct redisCommand *realcmd; /* The original command that was executed by the client,
-                                     Used to update error stats in case the c->cmd was modified
-                                     during the command invocation (like on GEOADD for example). */
     user *user;             /* User associated with this connection. If the
                                user is set to NULL the connection can do
                                anything (admin). */
-    int reqtype;            /* Request protocol type: PROTO_REQ_* */
-    int multibulklen;       /* Number of multi bulk arguments left to read. */
-    long bulklen;           /* Length of bulk argument in multi bulk request. */
-    list *reply;            /* List of reply objects to send to the client. */
+    uint64_t id;            /* Client incremental unique ID. */
     unsigned long long reply_bytes; /* Tot bytes of objects in reply list. */
+    connection *conn;
     list *deferred_reply_errors;    /* Used for module thread safe contexts. */
-    size_t sentlen;         /* Amount of bytes already sent in the current
-                               buffer or object being sent. */
     time_t ctime;           /* Client creation time. */
-    long duration;          /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
-    int slot;               /* The slot the client is executing against. Set to -1 if no slot is being used */
-    int cluster_compatibility_check_slot; /* The slot the client is executing against for cluster compatibility check.
-                                           * -2 means we don't need to check slot violation, or we already found
-                                           * a violation, reported it and don't need to continue checking.
-                                           * -1 means we're looking for the slot number and didn't find it yet.
-                                           * any positive number means we found a slot and no violation yet. */
     dictEntry *cur_script;  /* Cached pointer to the dictEntry of the script being executed. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
-    time_t obuf_soft_limit_reached_time;
-    int authenticated;      /* Needed when the default user requires auth. */
-    int replstate;          /* Replication state if this is a slave. */
+    mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
+    size_t buf_usable_size; /* Usable size of buffer. */
+    char *buf;
+    size_t sentlen;         /* Amount of bytes already sent in the current
+                               buffer or object being sent. */
+    list *reply;            /* List of reply objects to send to the client. */
+    int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
+    int argv_len;           /* Size of argv array (may be more than argc) */
+    robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
     int repl_start_cmd_stream_on_ack; /* Install slave write handler on first ACK. */
     int repldbfd;           /* Replication DB file descriptor. */
     off_t repldboff;        /* Replication DB file offset. */
@@ -1380,6 +1392,7 @@ typedef struct client {
                                        copying this slave output buffer
                                        should use. */
     char replid[CONFIG_RUN_ID_SIZE+1]; /* Master replication ID (if master). */
+    uint8_t last_memory_type;
     int slave_listening_port; /* As configured with: REPLCONF listening-port */
     char *slave_addr;       /* Optionally given by REPLCONF ip-address */
     int slave_capa;         /* Slave capabilities: SLAVE_CAPA_* bitwise OR. */
@@ -1426,7 +1439,6 @@ typedef struct client {
      * client, and in which category the client was, in order to remove it
      * before adding it the new value. */
     size_t last_memory_usage;
-    int last_memory_type;
 
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
@@ -1435,15 +1447,6 @@ typedef struct client {
                                   * see the definition of replBufBlock. */
     size_t ref_block_pos;        /* Access position of referenced buffer block,
                                   * i.e. the next offset to send. */
-
-    /* list node in clients_pending_write list */
-    listNode clients_pending_write_node;
-    /* Response buffer */
-    size_t buf_peak; /* Peak used size of buffer in last 5 sec interval. */
-    mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
-    int bufpos;
-    size_t buf_usable_size; /* Usable size of buffer. */
-    char *buf;
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -3303,7 +3306,7 @@ int processCommand(client *c);
 void commandProcessed(client *c);
 int processPendingCommandAndInputBuffer(client *c);
 int processCommandAndResetClient(client *c);
-int areCommandKeysInSameSlot(client *c, int *hashslot);
+int areCommandKeysInSameSlot(client *c, int16_t *hashslot);
 void setupSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(const char *typename);
