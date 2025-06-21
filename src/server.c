@@ -1140,14 +1140,18 @@ void clientsCron(void) {
 
     /* Pause the IO threads that are processing clients, to let us access clients
      * safely. In order to avoid increasing CPU usage by pausing all threads when
-     * there are too many io threads, we pause io threads in multiple batches. */
+     * there are too many io threads, we pause io threads in multiple batches.
+     * NOTE: If the number of IO threads exceeds 8 (CLIENTS_CRON_PAUSE_IOTHREAD),
+     * processing all clients may take a few seconds, potentially breaking the
+     * assumption that all clients are processed within 1 second. */
     static int start = 1, end = 0;
-    if (server.io_threads_num >= 1 && listLength(server.clients) > 0) {
+    if (server.io_threads_num > 1 && listLength(server.clients) > 0) {
         end = start + CLIENTS_CRON_PAUSE_IOTHREAD - 1;
         if (end >= server.io_threads_num) end = server.io_threads_num - 1;
         pauseIOThreadsRange(start, end);
     }
 
+    list *unprocessed_clients = listCreate();
     while(listLength(server.clients) && iterations--) {
         client *c;
         listNode *head;
@@ -1158,11 +1162,16 @@ void clientsCron(void) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
 
+        /* Skip clients that are being processed by the IO threads that
+         * are not paused. */
         if (c->running_tid != IOTHREAD_MAIN_THREAD_ID &&
             !(c->running_tid >= start && c->running_tid <= end))
         {
-            /* Skip clients that are being processed by the IO threads that
-             * are not paused. */
+            /* To avoid the client never being processed, we record it and will
+             * try to process it in the next iteration. */
+            listNode *ln = listLast(server.clients);
+            listUnlinkNode(server.clients, ln);
+            listLinkNodeTail(unprocessed_clients, ln);
             continue;
         }
 
@@ -1187,6 +1196,14 @@ void clientsCron(void) {
 
         if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
     }
+
+    /* Put the unprocessed clients at the beginning of the client list
+     * to process them in the next iteration. */
+    if (listLength(unprocessed_clients) > 0) {
+        listJoin(unprocessed_clients, server.clients);
+        listJoin(server.clients, unprocessed_clients);
+    }
+    listRelease(unprocessed_clients);
 
     /* Resume the IO threads that were paused */
     if (end) {
