@@ -6,6 +6,13 @@
     "since": "8.0.0",
     "arity": -1,
     "function": "vaddCommand",
+    "command_flags": [
+      "WRITE",
+      "DENYOOM"
+    ],
+    "acl_categories": [
+      "VECTORSET"
+    ],
     "arguments": [
       {
         "name": "key",
@@ -92,10 +99,6 @@
         "type": "integer",
         "optional": true
       }
-    ],
-    "command_flags": [
-      "WRITE",
-      "DENYOOM"
     ]
   },
   "VREM": {
@@ -107,6 +110,9 @@
     "function": "vremCommand",
     "command_flags": [
       "WRITE"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
@@ -129,6 +135,9 @@
     "function": "vsimCommand",
     "command_flags": [
       "READONLY"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
@@ -221,6 +230,9 @@
       "READONLY",
       "FAST"
     ],
+    "acl_categories": [
+      "VECTORSET"
+    ],
     "arguments": [
       {
         "name": "key",
@@ -239,6 +251,9 @@
       "READONLY",
       "FAST"
     ],
+    "acl_categories": [
+      "VECTORSET"
+    ],
     "arguments": [
       {
         "name": "key",
@@ -255,6 +270,9 @@
     "function": "vembCommand",
     "command_flags": [
       "READONLY"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
@@ -282,6 +300,9 @@
     "function": "vlinksCommand",
     "command_flags": [
       "READONLY"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
@@ -311,6 +332,9 @@
       "READONLY",
       "FAST"
     ],
+    "acl_categories": [
+      "VECTORSET"
+    ],
     "arguments": [
       {
         "name": "key",
@@ -327,6 +351,9 @@
     "function": "vsetattrCommand",
     "command_flags": [
       "WRITE"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
@@ -353,6 +380,9 @@
     "command_flags": [
       "READONLY"
     ],
+    "acl_categories": [
+      "VECTORSET"
+    ],
     "arguments": [
       {
         "name": "key",
@@ -373,6 +403,9 @@
     "function": "vrandmemberCommand",
     "command_flags": [
       "READONLY"
+    ],
+    "acl_categories": [
+      "VECTORSET"
     ],
     "arguments": [
       {
