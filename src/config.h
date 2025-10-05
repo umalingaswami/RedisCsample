@@ -2,9 +2,14 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
+ * Copyright (c) 2025-Present, Valkey contributors.
+ * All rights reserved.
+ *
  * Licensed under your choice of (a) the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
  * GNU Affero General Public License v3 (AGPLv3).
+ * 
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
 #ifndef __CONFIG_H
@@ -345,17 +350,25 @@ void setcpuaffinity(const char *cpulist);
     #define ATTRIBUTE_TARGET_POPCNT
 #endif
 
-/* Check if we can compile AVX2 code */
+/* Check if we can compile SIMD code */
 #if defined (__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4))
 #if defined(__has_attribute) && __has_attribute(target)
-#define HAVE_AVX2
+#define HAVE_X86_SIMD
 #endif
 #endif
 
-#if defined (HAVE_AVX2)
+#if defined (HAVE_X86_SIMD)
 #define ATTRIBUTE_TARGET_AVX2 __attribute__((target("avx2")))
+#define ATTRIBUTE_TARGET_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl")))
 #else
 #define ATTRIBUTE_TARGET_AVX2
+#define ATTRIBUTE_TARGET_AVX512
+#endif
+
+#if defined(__linux__) && defined(__GLIBC__) && (defined(__GNUC__) && (__GNUC__ > 4) || defined(__clang__) && (__clang_major__) > 5)
+#define HAVE_IFUNC 1
+#else
+#define HAVE_IFUNC 0
 #endif
 
 #endif
