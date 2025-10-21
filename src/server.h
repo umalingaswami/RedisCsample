@@ -760,10 +760,12 @@ typedef enum {
 #define NOTIFY_TYPE_CHANGED (1<<16) /* c, key type changed notification (Note: excluded from NOTIFY_ALL) */
 #define NOTIFY_ALL (NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED | NOTIFY_STREAM | NOTIFY_MODULE) /* A flag */
 
+#define _run_with_period(_cronloops_, _ms_, _hz_) if (((_ms_) <= 1000/(_hz_)) || !((_cronloops_)%((_ms_)/(1000/(_hz_)))))
+
 /* Using the following macro you can run code inside serverCron() with the
  * specified period, specified in milliseconds.
  * The actual resolution depends on server.hz. */
-#define run_with_period(_ms_) if (((_ms_) <= 1000/server.hz) || !(server.cronloops%((_ms_)/(1000/server.hz))))
+#define run_with_period(_ms_) _run_with_period(server.cronloops, (_ms_), server.hz)
 
 /* We can print the stacktrace, so our assert is defined this way: */
 #define serverAssertWithInfo(_c,_o,_e) (likely(_e)?(void)0 : (_serverAssertWithInfo(_c,_o,#_e,__FILE__,__LINE__),redis_unreachable()))
@@ -1095,7 +1097,26 @@ typedef struct clientReplyBlock {
  * node, it should first increase the next node's refcount, and when we trim
  * the replication buffer nodes, we remove node always from the head node which
  * refcount is 0. If the refcount of the head node is not 0, we must stop
- * trimming and never iterate the next node. */
+ * trimming and never iterate the next node.
+ *
+ * For replicas in IO threads we don't update the refcount while sending the
+ * repl data, but only when the thread is send back to main. This avoids data
+ * races. In order to achieve this the replica clients keeps track of following:
+ * - ref_repl_start_node - the node we started to send repl data from
+ * - ref_repl_buf_node - the current node we've reached
+ * - ref_repl_last_node - the last node in the replication buffer as seen by
+ *                        the replica client before it was send to IO thread
+ *
+ * When the client is send to main it can decrement ref_repl_start_node's refcount
+ * and increment it for ref_repl_buf_node, since all the nodes in-between are
+ * already send and the client doesn't hold reference to them.
+ *
+ * `ref_repl_last_node` is needed since while sending data IO thread needs to
+ * know when to stop. If it was reading directly from the replication buffer
+ * there will be a data race on the last node when main thread write to it
+ * during `feedReplicationBuffer`. `ref_repl_last_node` is cached in the client
+ * together with its used size just before sending the client to IO thread
+ * in `handleClientsWithPendingWrites`. */
 
 /* Similar with 'clientReplyBlock', it is used for shared buffers between
  * all replica clients and replication backlog. */
@@ -1103,7 +1124,8 @@ typedef struct replBufBlock {
     int refcount;           /* Number of replicas or repl backlog using. */
     long long id;           /* The unique incremental number. */
     long long repl_offset;  /* Start replication offset of the block. */
-    size_t size, used;
+    size_t size;            /* Capacity of the buf in bytes */
+    size_t used;            /* Count of written bytes */
     char buf[];
 } replBufBlock;
 
@@ -1374,8 +1396,13 @@ typedef struct client {
                                            * any positive number means we found a slot and no violation yet. */
     dictEntry *cur_script;  /* Cached pointer to the dictEntry of the script being executed. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
+    time_t io_lastinteraction; /* Time of the last interaction as seen from
+                                * IO thread. When the client is moved to main
+                                * it updates its `lastinteraction` value from
+                                * this. */
     time_t obuf_soft_limit_reached_time;
-    mstime_t last_cron_check_time;    /* The last client check time in cron */
+    mstime_t io_last_client_cron_check_time;    /* The last client cron check time in IO thread */
+    mstime_t io_last_repl_cron_check_time;    /* The last replication cron check time in IO thread */
     int authenticated;      /* Needed when the default user requires auth. */
     int replstate;          /* Replication state if this is a slave. */
     int repl_start_cmd_stream_on_ack; /* Install slave write handler on first ACK. */
@@ -1384,11 +1411,18 @@ typedef struct client {
     off_t repldbsize;       /* Replication DB file size. */
     sds replpreamble;       /* Replication DB preamble. */
     long long read_reploff; /* Read replication offset if this is a master. */
+    long long io_acc_read_reploff; /* Accumulation of read replication offset
+                                    * from last read if this is a master in IO
+                                    * thread. read_reploff is updated with this
+                                    * value when the client is moved to main. */
     long long reploff;      /* Applied replication offset if this is a master. */
     long long repl_applied; /* Applied replication data count in querybuf, if this is a replica. */
     long long repl_ack_off; /* Replication ack offset, if this is a slave. */
     long long repl_aof_off; /* Replication AOF fsync ack offset, if this is a slave. */
     long long repl_ack_time;/* Replication ack time, if this is a slave. */
+    mstime_t io_last_ack_time; /* Replication ack time, if this is a slave in
+                                * IO thread. Used only to check if slave needs
+                                * to be kept in IO thread for ACK read. */
     long long repl_last_partial_write; /* The last time the server did a partial write from the RDB child pipe to this replica  */
     long long psync_initial_offset; /* FULLRESYNC reply offset other slaves
                                        copying this slave output buffer
@@ -1445,10 +1479,22 @@ typedef struct client {
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
 
-    listNode *ref_repl_buf_node; /* Referenced node of replication buffer blocks,
-                                  * see the definition of replBufBlock. */
-    size_t ref_block_pos;        /* Access position of referenced buffer block,
-                                  * i.e. the next offset to send. */
+    listNode *ref_repl_start_node; /* Referenced node of replication buffer blocks
+                                    * indicating the initial data this client
+                                    * starts to send. Used by IO threads to keep
+                                    * track of nodes' refcounts. see replBufBlock. */
+    listNode *ref_repl_buf_node;   /* Referenced node of replication buffer blocks,
+                                    * indicating the current node we need to send
+                                    * from.
+                                    * see the definition of replBufBlock. */
+    size_t ref_block_pos;          /* Access position of referenced buffer block,
+                                    * i.e. the next offset to send. */
+    listNode *ref_last_node;       /* Cached reference to the last node in the
+                                    * replication buffer. Used only by IO thread
+                                    * to avoid contention with main thread when
+                                    * it feeds the replication buffer. */
+    size_t ref_last_node_used;     /* Cached value of the used bytes in
+                                    * ref_last_node. */
 
     /* list node in clients_pending_write list */
     listNode clients_pending_write_node;
@@ -1484,6 +1530,8 @@ typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
     pthread_mutex_t pending_clients_mutex;      /* Mutex for pending write list */
     list *pending_clients_to_main_thread;       /* Clients that are waiting to be executed by the main thread. */
     list *clients;                              /* IO thread managed clients. */
+    size_t cronloops;
+    client *master;
 } IOThread;
 
 /* ACL information */
@@ -3145,6 +3193,9 @@ void abortFailover(const char *err);
 const char *getFailoverStateString(void);
 int replicationCheckHasMainChannel(client *slave);
 unsigned long replicationLogicalReplicaCount(void);
+int slaveFromIOThreadNeedsAckRead(client *slave);
+void putSlavesNeedingAckReadInPendingClientsToIOThreads(void);
+int runConnectedMasterClientReplicationCron(void);
 
 /* Generic persistence functions */
 void startLoadingFile(size_t size, char* filename, int rdbflags);

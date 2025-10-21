@@ -128,7 +128,18 @@ proc waitForBgrewriteaof r {
     }
 }
 
+proc is_tsan {} {
+    return [expr {[info exists ::tsan] && $::tsan}]
+}
+
 proc wait_for_sync r {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {[is_tsan]} {
+        set maxtries 100
+    }
+
     wait_for_condition 50 100 {
         [status $r master_link_status] eq "up"
     } else {
@@ -137,6 +148,12 @@ proc wait_for_sync r {
 }
 
 proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {[is_tsan]} {
+        set maxtries [expr {$maxtries * 2}]
+    }
+
     wait_for_condition $maxtries $delay {
         [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
@@ -145,7 +162,13 @@ proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
 }
 
 proc wait_for_ofs_sync {r1 r2} {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {[is_tsan]} {
+        set maxtries 100
+    }
+    wait_for_condition $maxtries 100 {
         [status $r1 master_repl_offset] eq [status $r2 master_repl_offset]
     } else {
         fail "replica offset didn't match in time"

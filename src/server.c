@@ -1756,6 +1756,23 @@ static void sendGetackToReplicas(void) {
     argv[1] = shared.getack;
     argv[2] = shared.special_asterick; /* Not used argument. */
     replicationFeedSlaves(server.slaves, -1, argv, 3);
+
+    if (server.io_threads_num == 1) return;
+
+    /* Since we want to read the ACK ASAP we make sure to return any replicas
+     * in main thread to IO thread ASAP. */
+    listIter li;
+    listNode *ln;
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        if (slave->tid != IOTHREAD_MAIN_THREAD_ID &&
+            slave->running_tid == IOTHREAD_MAIN_THREAD_ID)
+        {
+            putInPendingClienstForIOThreads(slave);
+        }
+    }
 }
 
 extern int ProcessingEventsWhileBlocked;
@@ -1913,6 +1930,15 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWrites();
+
+    /* IO thread replica clients that are waiting for new replication data will
+     * stay indefinitely in main thread if there is no new data. We must make
+     * sure to send them to IO thread from time to time to give them chance to
+     * read the ACK message. Otherwise, they will be disconnected after
+     * repl_timeout. The below function only checks for time passed since last
+     * ACK read. Replica clients that send REPLCONF GETACK are immediately
+     * put in the pendingClientsToIOThreads queue inside sendGetackToReplicas */
+    putSlavesNeedingAckReadInPendingClientsToIOThreads();
 
     /* Let io thread to handle its pending clients. */
     sendPendingClientsToIOThreads();
@@ -4666,6 +4692,14 @@ int finishShutdown(void) {
     while ((replicas_list_node = listNext(&replicas_iter)) != NULL) {
         client *replica = listNodeValue(replicas_list_node);
         num_replicas++;
+
+        /* Fetch the replica clients that are currently running in IO thread.
+         * If shutdown fails, they will be returned back to IO thread in
+         * handleClientsWithPendingWrites after the repl backlog is fed with new
+         * data. */
+        if (replica->running_tid != IOTHREAD_MAIN_THREAD_ID)
+            fetchClientFromIOThread(replica);
+
         if (replica->repl_ack_off != server.master_repl_offset) {
             num_lagging_replicas++;
             long lag = replica->replstate == SLAVE_STATE_ONLINE ?
@@ -6296,10 +6330,11 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
                     server.repl_down_since ?
                     (intmax_t)(server.unixtime-server.repl_down_since) : -1);
             } else {
-                info = sdscatprintf(info,
+                info = sdscatprintf(info, FMTARGS(
                     "master_link_up_since_seconds:%jd\r\n",
                     server.repl_up_since ? /* defensive code, should never be 0 when connected */
-                    (intmax_t)(server.unixtime-server.repl_up_since) : -1);
+                    (intmax_t)(server.unixtime-server.repl_up_since) : -1,
+                    "master_client_io_thread:%d\r\n", server.master->tid));
             }
             info = sdscatprintf(info, "total_disconnect_time_sec:%jd\r\n", (intmax_t)server.repl_total_disconnect_time+(current_disconnect_time));
 
@@ -6354,9 +6389,9 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
 
                 info = sdscatprintf(info,
                     "slave%d:ip=%s,port=%d,state=%s,"
-                    "offset=%lld,lag=%ld\r\n",
+                    "offset=%lld,lag=%ld,io-thread=%d\r\n",
                     slaveid,slaveip,slave->slave_listening_port,state,
-                    slave->repl_ack_off, lag);
+                    slave->repl_ack_off, lag, slave->tid);
                 slaveid++;
             }
         }

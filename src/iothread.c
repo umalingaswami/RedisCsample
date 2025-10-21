@@ -10,6 +10,10 @@
 
 #include "server.h"
 
+/* Replicates the behaviour of run_with_period used in serverCron but for
+ * IO threads. IO threads use default Hz for now. */
+#define run_with_period_io(_t_, _ms_) _run_with_period((_t_)->cronloops, (_ms_), CONFIG_DEFAULT_HZ)
+
 /* IO threads. */
 static IOThread IOThreads[IO_THREADS_MAX_NUM];
 
@@ -42,6 +46,30 @@ static inline void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check
     }
 }
 
+/* When moving a client from IO thread to main thread we may need to update
+ * some of its variables as they are duplicated to avoid contention with main
+ * thread.
+ * For now this is valid only for master or slave clients. */
+void updateClientDataFromIOThread(client *c) {
+    serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
+                 c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+
+    if (c->io_last_ack_time / 1000 > c->repl_ack_time) {
+        serverAssert(c->flags & CLIENT_SLAVE);
+        c->repl_ack_time = c->io_last_ack_time / 1000;
+    }
+    if (c->io_lastinteraction != 0) {
+        serverAssert(c->flags & CLIENT_MASTER);
+        c->lastinteraction = c->io_lastinteraction;
+        c->io_lastinteraction = 0;
+    }
+    if (c->io_acc_read_reploff != 0) {
+        serverAssert(c->flags & CLIENT_MASTER);
+        c->read_reploff += c->io_acc_read_reploff;
+        c->io_acc_read_reploff = 0;
+    }
+}
+
 /* When IO threads read a complete query of clients or want to free clients, it
  * should remove it from its clients list and put the client in the list to main
  * thread, we will send these clients to main thread in IOThreadBeforeSleep. */
@@ -59,6 +87,12 @@ void enqueuePendingClientsToMainThread(client *c, int unbind) {
         sendPendingClientsToMainThreadIfNeeded(t, 1);
         /* Disable read and write to avoid race when main thread processes. */
         c->io_flags &= ~(CLIENT_IO_READ_ENABLED | CLIENT_IO_WRITE_ENABLED);
+
+        if (c->flags & CLIENT_MASTER) {
+            serverAssert(t->master == NULL || t->master == c);
+            t->master = NULL;
+        }
+
         /* Remove the client from IO thread, add it to main thread's pending list. */
         listUnlinkNode(t->clients, c->io_thread_client_list_node);
         listLinkNodeTail(t->pending_clients_to_main_thread, c->io_thread_client_list_node);
@@ -66,15 +100,41 @@ void enqueuePendingClientsToMainThread(client *c, int unbind) {
     }
 }
 
+void putInPendingClienstForIOThreads(client *c) {
+    serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
+                 c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+
+    if (c->flags & CLIENT_PENDING_WRITE) {
+        c->flags &= ~CLIENT_PENDING_WRITE;
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+    }
+    if (c->flags & CLIENT_SLAVE) {
+        c->ref_last_node = listLast(server.repl_buffer_blocks);
+        c->ref_last_node_used = ((replBufBlock*)listNodeValue(c->ref_last_node))->used;
+    }
+
+    c->running_tid = c->tid;
+    listAddNodeHead(mainThreadPendingClientsToIOThreads[c->tid], c);
+}
+
 /* Unbind connection of client from io thread event loop, write and read handlers
  * also be removed, ensures that we can operate the client safely. */
 void unbindClientFromIOThreadEventLoop(client *c) {
     serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
                  c->running_tid == IOTHREAD_MAIN_THREAD_ID);
-    if (!connHasEventLoop(c->conn)) return;
+    /* If the client is not bound to an event loop there is nothing to do,
+     * unless the client is master in which case we need to make the IOThread
+     * forget about it. */
+    if (!connHasEventLoop(c->conn) && !(c->flags & CLIENT_MASTER)) return;
+
     /* As calling in main thread, we should pause the io thread to make it safe. */
     pauseIOThread(c->tid);
     connUnbindEventLoop(c->conn);
+    updateClientDataFromIOThread(c);
+    if (c->flags & CLIENT_MASTER) {
+        IOThread *t = &IOThreads[c->tid];
+        t->master = NULL;
+    }
     resumeIOThread(c->tid);
 }
 
@@ -131,6 +191,23 @@ void fetchClientFromIOThread(client *c) {
     connUnbindEventLoop(c->conn);
     /* Now main thread can process it. */
     c->running_tid = IOTHREAD_MAIN_THREAD_ID;
+    updateClientDataFromIOThread(c);
+    if (c->flags & CLIENT_MASTER) {
+        IOThread *t = &IOThreads[c->tid];
+        t->master = NULL;
+    }
+    // A slave client may be fetched to main thread in order to flush its buffer
+    // but in order to send any pending writes we need either a write handler or
+    // a CLIENT_PENDING_WRITE flag. See flushSlavesOutputBuffers
+    if (c->flags & CLIENT_SLAVE && clientHasPendingReplies(c)) {
+        c->flags |= CLIENT_PENDING_WRITE;
+        listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+    }
+
+    /* As client may be fetched to main thread but later returned (f.e
+     * flushSlavesOutputBuffers) make sure the flags are properly set. */
+    c->io_flags &= ~(CLIENT_IO_READ_ENABLED | CLIENT_IO_WRITE_ENABLED);
+
     resumeIOThread(c->tid);
     freeClientDeferredObjects(c, 1); /* Free deferred objects. */
 }
@@ -139,17 +216,50 @@ void fetchClientFromIOThread(client *c) {
  * data race to be processed in IO threads.
  *
  * - Close ASAP, we must free the client in main thread.
- * - Replica, pubsub, monitor, blocked, tracking clients, main thread may
+ * - Pubsub, monitor, blocked, tracking clients, main thread may
  *   directly write them a reply when conditions are met.
- * - Script command with debug may operate connection directly. */
+ * - Script command with debug may operate connection directly.
+ * - Master/Replica are only handled by IO thread when RDB replication is
+ *   completed. Note we need to check them after checking for other flags
+ *   that may overlap with CLIENT_MASTER/SLAVE - CLOSE_ASAP, MONITOR,
+ *   (UN)BLOCKED, TRACKING. */
 int isClientMustHandledByMainThread(client *c) {
-    if (c->flags & (CLIENT_CLOSE_ASAP | CLIENT_MASTER | CLIENT_SLAVE |
+    if (c->flags & (CLIENT_CLOSE_ASAP |
                     CLIENT_PUBSUB | CLIENT_MONITOR | CLIENT_BLOCKED |
                     CLIENT_UNBLOCKED | CLIENT_TRACKING | CLIENT_LUA_DEBUG |
                     CLIENT_LUA_DEBUG_SYNC))
     {
         return 1;
     }
+
+    /* If RDB replication is done it's safe to move the master client to an IO thread */
+    if (c->flags & CLIENT_MASTER &&
+        server.repl_state == REPL_STATE_CONNECTED &&
+        server.repl_rdb_ch_state == REPL_RDB_CH_STATE_NONE)
+    {
+        return 0;
+    }
+
+    /* If RDB replication is done for this slave it's safe to move it to an IO thread
+     * Note that we also check if the ref_repl_start_node is initialized in order
+     * to prevent race conditions with main thread when it feeds the replication
+     * buffer. */
+    if (c->flags & CLIENT_SLAVE &&
+        c->replstate == SLAVE_STATE_ONLINE &&
+        c->repl_start_cmd_stream_on_ack == 0 &&
+        c->ref_repl_start_node != NULL)
+    {
+        return 0;
+    }
+
+    if (c->flags & (CLIENT_MASTER | CLIENT_SLAVE)) return 1;
+
+    /* Keep replica clients in main thread during handshake phase.
+     * slave_listening_port is the first indication this client may be slave,
+     * see syncWithMaster and replconfCommand, note CLIENT_SLAVE flag is not
+     * yet raised. */
+    if (c->slave_listening_port != 0) return 1;
+
     return 0;
 }
 
@@ -175,6 +285,14 @@ void assignClientToIOThread(client *c) {
 
     /* The client running in IO thread needs to have deferred objects array. */
     c->deferred_objects = zmalloc(sizeof(robj*) * CLIENT_MAX_DEFERRED_OBJECTS);
+
+    /* Initial caching of replication buffer's last node. See comment above
+     * replBufBlock for more info */
+    if (c->flags & CLIENT_SLAVE) {
+        c->ref_last_node = listLast(server.repl_buffer_blocks);
+        if (c->ref_last_node)
+            c->ref_last_node_used = ((replBufBlock*)listNodeValue(c->ref_last_node))->used;
+    }
 
     /* Unbind connection of client from main thread event loop, disable read and
      * write, and then put it in the list, main thread will send these clients
@@ -452,11 +570,32 @@ int processClientsFromIOThread(IOThread *t) {
             continue;
         }
 
-        /* Run cron task for the client per second or it is marked as pending cron. */
-        if (c->last_cron_check_time + 1000 <= server.mstime ||
+        updateClientDataFromIOThread(c);
+
+        /* IO thread has send all the nodes from [ref_repl_start_node, ref_repl_buf_node)
+         * Since it only keeps refcount to the start_node we need to decrement
+         * it and increment the refcount of the lastly processed buf_node which
+         * will become the new start node for the next IO thread iteration. */
+        if (c->flags & CLIENT_SLAVE && c->ref_repl_start_node != NULL &&
+            c->ref_repl_start_node != c->ref_repl_buf_node)
+        {
+            serverAssert(c->ref_repl_buf_node);
+
+            ((replBufBlock*)listNodeValue(c->ref_repl_start_node))->refcount--;
+            ((replBufBlock*)listNodeValue(c->ref_repl_buf_node))->refcount++;
+
+            /* Forget about nodes before ref_repl_buf_node as we already
+             * processed them */
+            c->ref_repl_start_node = c->ref_repl_buf_node;
+
+            incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
+        }
+
+        /* Run client cron task for the client per second or it is marked as pending cron. */
+        if (c->io_last_client_cron_check_time + 1000 <= server.mstime ||
             c->io_flags & CLIENT_IO_PENDING_CRON)
         {
-            c->last_cron_check_time = server.mstime;
+            c->io_last_client_cron_check_time = server.mstime;
             if (clientsCronRunClient(c)) continue;
         } else {
             /* Update the client in the mem usage if clientsCronRunClient is not
@@ -473,6 +612,18 @@ int processClientsFromIOThread(IOThread *t) {
             }
         }
 
+        /* Check if we need to run replication for master client.
+         * Run cron more frequently during failover - see replicationCron */
+        int repl_cron_freq = 1000;
+        if (server.failover_state != NO_FAILOVER)
+            repl_cron_freq = 100;
+        if (c->flags & CLIENT_MASTER &&
+            c->io_last_repl_cron_check_time + repl_cron_freq <= server.mstime)
+        {
+            c->io_last_repl_cron_check_time = server.mstime;
+            if (runConnectedMasterClientReplicationCron()) continue;
+        }
+
         /* We may have pending replies if io thread may not finish writing
          * reply to client, so we did not put the client in pending write
          * queue. And we should do that first since we may keep the client
@@ -487,16 +638,34 @@ int processClientsFromIOThread(IOThread *t) {
             continue;
         }
 
+        /* IO thread replicas are always kept in main so they are updated with
+         * the latest repl buffer data ASAP. Generally when the replica client
+         * is sent to main thread it can encounter two cases:
+         *   - no new replication data so it remains in main until there is.
+         *     When new command is processed propagateNow will call
+         *     replicationFeedSlaves which in turn will put the client in the
+         *     pending write queue. handleClientsWithPendingWrites will deal
+         *     with it by updating the proper repl-buf-node refs and sending it
+         *     back to IO thread.
+         *   - there is new repl data, so the client is immediately put in the
+         *     pending write queue. Again handleClientsWithPendingWrites will
+         *     deal with it.
+         */
+        if (c->flags & CLIENT_SLAVE) {
+            continue;
+        }
+
         /* Remove this client from pending write clients queue of main thread,
          * And some clients may do not have reply if CLIENT REPLY OFF/SKIP. */
         if (c->flags & CLIENT_PENDING_WRITE) {
             c->flags &= ~CLIENT_PENDING_WRITE;
             listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         }
+
         c->running_tid = c->tid;
         listLinkNodeHead(mainThreadPendingClientsToIOThreads[c->tid], node);
         node = NULL;
-    
+
         /* If there are several clients to process, let io thread handle them ASAP. */
         sendPendingClientsToIOThreadIfNeeded(t, 1);
     }
@@ -612,6 +781,13 @@ int processClientsFromMainThread(IOThread *t) {
             connSetReadHandler(c->conn, readQueryFromClient);
         }
 
+        /* Cache a pointer to the master so we can quickly check if it needs
+         * to be send to main thread for its replication cron in case it's
+         * waiting for long inside the IO thread */
+        if (c->flags & CLIENT_MASTER) {
+            t->master = c;
+        }
+
         /* If the client has pending replies, write replies to client. */
         if (clientHasPendingReplies(c)) {
             writeToClient(c, 0);
@@ -633,6 +809,10 @@ void IOThreadBeforeSleep(struct aeEventLoop *el) {
 
     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData(el);
+
+    /* Previous loop may have enqueued clients to main thread, send them before
+     * processing clients from main thread */
+    sendPendingClientsToMainThreadIfNeeded(t, 0);
 
     /* Process clients from main thread, since the main thread may deliver clients
      * without notification during IO thread processing events. */
@@ -682,9 +862,23 @@ void IOThreadClientsCron(IOThread *t) {
     listRewind(t->clients, &li);
     while ((ln = listNext(&li)) && iterations--) {
         client *c = listNodeValue(ln);
+        /* Master clients are handled by IOThreadReplicationCron */
+        if (c->flags & CLIENT_MASTER) continue;
         /* Mark the client as pending cron, main thread will process it. */
         c->io_flags |= CLIENT_IO_PENDING_CRON;
         enqueuePendingClientsToMainThread(c, 0);
+    }
+}
+
+void IOThreadReplicationCron(IOThread *t) {
+    if (t->master)
+        serverAssert(t->master->tid == t->id &&
+                     t->master->running_tid == t->master->tid);
+
+    /* Send to main thread so that processClientsFromIOThread can check if it
+     * needs to call runConnectedMasterClientReplicationCron */
+    if (t->master && !(t->master->flags & CLIENT_PRE_PSYNC)) {
+        enqueuePendingClientsToMainThread(t->master, 0);
     }
 }
 
@@ -697,7 +891,11 @@ int IOThreadCron(struct aeEventLoop *eventLoop, long long id, void *clientData) 
     IOThread *t = clientData;
 
     /* Run cron tasks for the clients in the IO thread. */
+    run_with_period_io(t, 500) IOThreadReplicationCron(t);
+
     IOThreadClientsCron(t);
+
+    t->cronloops++;
 
     return 1000/CONFIG_DEFAULT_HZ;
 }
@@ -741,6 +939,8 @@ void initThreadedIO(void) {
         t->processing_clients = listCreate();
         t->pending_clients_to_main_thread = listCreate();
         t->clients = listCreate();
+        t->cronloops = 0;
+        t->master = NULL;
         atomicSetWithSync(t->paused, IO_THREAD_UNPAUSED);
         atomicSetWithSync(t->running, 0);
 

@@ -97,6 +97,55 @@ unsigned long replicationLogicalReplicaCount(void) {
     return count;
 }
 
+int slaveFromIOThreadNeedsAckRead(client *slave) {
+    serverAssert(slave->tid != IOTHREAD_MAIN_THREAD_ID);
+
+    mstime_t ms_since_last_ack = mstime() - slave->io_last_ack_time;
+    return ms_since_last_ack >= 500;
+}
+
+void putSlavesNeedingAckReadInPendingClientsToIOThreads(void) {
+    listIter li;
+    listNode *ln;
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        if (slave->tid != IOTHREAD_MAIN_THREAD_ID &&
+            slave->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+            slaveFromIOThreadNeedsAckRead(slave))
+        {
+            putInPendingClienstForIOThreads(slave);
+        }
+    }
+}
+
+/* Run some cron tasks for a connected master client. Return 1 when the client
+ * is freed, 0 otherwise. */
+int runConnectedMasterClientReplicationCron(void) {
+    /* Timed out master when we are an already connected slave? */
+    if (server.masterhost && server.repl_state == REPL_STATE_CONNECTED &&
+        server.master->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+        (time(NULL)-server.master->lastinteraction) > server.repl_timeout)
+    {
+        serverLog(LL_WARNING,"MASTER timeout: no data nor PING received...");
+        freeClient(server.master);
+        return 1;
+    }
+
+    /* Send ACK to master from time to time.
+     * Note that we do not send periodic acks to masters that don't
+     * support PSYNC and replication offsets. */
+    if (server.masterhost && server.master &&
+        server.master->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+        !(server.master->flags & CLIENT_PRE_PSYNC))
+    {
+        replicationSendAck();
+    }
+
+    return 0;
+}
+
 static ConnectionType *connTypeOfReplication(void) {
     if (server.tls_replication) {
         return connectionTypeTls();
@@ -372,15 +421,22 @@ void incrementalTrimReplicationBacklog(size_t max_blocks) {
 
 /* Free replication buffer blocks that are referenced by this client. */
 void freeReplicaReferencedReplBuffer(client *replica) {
-    if (replica->ref_repl_buf_node != NULL) {
+    serverAssert(replica->running_tid == IOTHREAD_MAIN_THREAD_ID);
+
+    if (replica->ref_repl_start_node != NULL) {
         /* Decrease the start buffer node reference count. */
-        replBufBlock *o = listNodeValue(replica->ref_repl_buf_node);
+        replBufBlock *o = listNodeValue(replica->ref_repl_start_node);
+
         serverAssert(o->refcount > 0);
         o->refcount--;
+
         incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
     }
+    replica->ref_repl_start_node = NULL;
     replica->ref_repl_buf_node = NULL;
+    replica->ref_last_node = NULL;
     replica->ref_block_pos = 0;
+    replica->ref_last_node_used = 0;
 }
 
 /* Append bytes into the global replication buffer list, replication backlog and
@@ -432,6 +488,7 @@ void feedReplicationBuffer(char *s, size_t len) {
             size_t copy = (tail->size >= len) ? len : tail->size;
             tail->used = copy;
             tail->refcount = 0;
+
             tail->repl_offset = server.master_repl_offset + 1;
             tail->id = repl_block_id++;
             memcpy(tail->buf, s, copy);
@@ -457,7 +514,8 @@ void feedReplicationBuffer(char *s, size_t len) {
             if (!canFeedReplicaReplBuffer(slave)) continue;
 
             /* Update shared replication buffer start position. */
-            if (slave->ref_repl_buf_node == NULL) {
+            if (slave->ref_repl_start_node == NULL) {
+                slave->ref_repl_start_node = start_node;
                 slave->ref_repl_buf_node = start_node;
                 slave->ref_block_pos = start_pos;
                 /* Only increase the start block reference count. */
@@ -686,6 +744,8 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
 /* Feed the slave 'c' with the replication backlog starting from the
  * specified 'offset' up to the end of the backlog. */
 long long addReplyReplicationBacklog(client *c, long long offset) {
+    serverAssert(c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+
     long long skip;
 
     serverLog(LL_DEBUG, "[PSYNC] Replica request offset: %lld", offset);
@@ -746,6 +806,7 @@ long long addReplyReplicationBacklog(client *c, long long offset) {
     /* Setting output buffer of the replica. */
     replBufBlock *o = listNodeValue(node);
     o->refcount++;
+    c->ref_repl_start_node = node;
     c->ref_repl_buf_node = node;
     c->ref_block_pos = offset - o->repl_offset;
 
@@ -1332,6 +1393,8 @@ void replconfCommand(client *c) {
                     c->repl_aof_off = offset;
             }
             c->repl_ack_time = server.unixtime;
+            c->io_last_ack_time = mstime();
+
             /* If this was a diskless replication, we need to really put
              * the slave online when the first ACK is received (which
              * confirms slave is online and ready to get more data). This
@@ -4186,6 +4249,7 @@ void replicationSendAck(void) {
  */
 void replicationCacheMaster(client *c) {
     serverAssert(server.master != NULL && server.cached_master == NULL);
+    serverAssert(server.master->running_tid == IOTHREAD_MAIN_THREAD_ID);
     serverLog(LL_NOTICE,"Caching the disconnected master state.");
 
     /* Unlink the client from the server structures. */
@@ -4205,6 +4269,15 @@ void replicationCacheMaster(client *c) {
     c->reply_bytes = 0;
     c->bufpos = 0;
     resetClient(c);
+
+    /* If the master client was handled by an IO thread we make sure to reset
+     * it's thread to the main one as later during resurrection/discarding the
+     * cached master we want that to be handled in the main thread.
+     * This is safe to do as replicationCacheMaster is called by freeClient
+     * and we must have already unbound the IO thread event loop. */
+    if (server.master->tid != IOTHREAD_MAIN_THREAD_ID) {
+        server.master->tid = IOTHREAD_MAIN_THREAD_ID;
+    }
 
     /* Save the master. Server.master will be set to null later by
      * replicationHandleMasterDisconnection(). */
@@ -4279,6 +4352,8 @@ void replicationDiscardCachedMaster(void) {
  * so the stream of data that we'll receive will start from where this
  * master left. */
 void replicationResurrectCachedMaster(connection *conn) {
+    serverAssert(server.cached_master->tid == IOTHREAD_MAIN_THREAD_ID);
+
     server.master = server.cached_master;
     server.cached_master = NULL;
     server.master->conn = conn;
@@ -4623,14 +4698,6 @@ void replicationCron(void) {
         cancelReplicationHandshake(1);
     }
 
-    /* Timed out master when we are an already connected slave? */
-    if (server.masterhost && server.repl_state == REPL_STATE_CONNECTED &&
-        (time(NULL)-server.master->lastinteraction) > server.repl_timeout)
-    {
-        serverLog(LL_WARNING,"MASTER timeout: no data nor PING received...");
-        freeClient(server.master);
-    }
-
     /* Check if we should connect to a MASTER */
     if (server.repl_state == REPL_STATE_CONNECT) {
         serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
@@ -4638,12 +4705,7 @@ void replicationCron(void) {
         connectWithMaster();
     }
 
-    /* Send ACK to master from time to time.
-     * Note that we do not send periodic acks to masters that don't
-     * support PSYNC and replication offsets. */
-    if (server.masterhost && server.master &&
-        !(server.master->flags & CLIENT_PRE_PSYNC))
-        replicationSendAck();
+    runConnectedMasterClientReplicationCron();
 
     /* If we have attached slaves, PING them from time to time.
      * So slaves can implement an explicit timeout to masters, and will
