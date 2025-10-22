@@ -1731,11 +1731,18 @@ void sdiffstoreCommand(client *c) {
 }
 
 void sscanCommand(client *c) {
-    kvobj *set;
-    unsigned long long cursor;
+    robj *set;
+    scanOptions opts = {0};
 
-    if (parseScanCursorOrReply(c,c->argv[2],&cursor) == C_ERR) return;
-    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyscan)) == NULL ||
-        checkType(c,set,OBJ_SET)) return;
-    scanGenericCommand(c,set,cursor);
+    if (parseScanCursorOrReply(c, c->argv[2], &opts.cursor) == C_ERR) return;
+    if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.emptyscan)) == NULL ||
+        checkType(c, set, OBJ_SET)) return;
+
+    if (parseScanOptionsOrReply(c, set, 3, &opts) == C_ERR) return;
+
+    if(set->encoding == OBJ_ENCODING_HT) {
+        scanHashTable(c, set, set->ptr, &opts, 0);
+    } else {
+        scanIntSet(c,set, &opts);
+    }
 }

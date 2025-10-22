@@ -2946,14 +2946,25 @@ void hexistsCommand(client *c) {
 }
 
 void hscanCommand(client *c) {
-    kvobj *o;
-    unsigned long long cursor;
+    robj *o;
+    scanOptions opts = {0};
 
-    if (parseScanCursorOrReply(c,c->argv[2],&cursor) == C_ERR) return;
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptyscan)) == NULL ||
-        checkType(c,o,OBJ_HASH)) return;
+    if (parseScanCursorOrReply(c, c->argv[2], &opts.cursor) == C_ERR) return;
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.emptyscan)) == NULL ||
+        checkType(c, o, OBJ_HASH)) return;
 
-    scanGenericCommand(c,o,cursor);
+    if (parseScanOptionsOrReply(c, o, 3, &opts) == C_ERR) return;
+
+    /* Handle hash encoding-specific scanning */
+    if (o->encoding == OBJ_ENCODING_HT) {
+        scanHashTable(c, o, o->ptr, &opts, 1);
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        scanListpack(c, o, &opts);
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+        scanListpackEx(c, o, &opts);
+    } else {
+        serverPanic("Not handled encoding in HSCAN.");
+    }
 }
 
 static void hrandfieldReplyWithListpack(client *c, unsigned int count, listpackEntry *keys, listpackEntry *vals) {
