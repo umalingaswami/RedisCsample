@@ -2220,8 +2220,8 @@ static int parseHashFieldExpireArgs(client *c, int *flags,
                 return C_ERR;
             }
 
-            /* Skip over numfields and all field-value pairs */
-            /* Set i to the last position of the FIELDS block, loop will increment past it */
+            /* Skip over numfields and all field-value pairs
+               Set i to the last position of the FIELDS block, loop will increment past it */
             i = *first_field_pos + (*field_count * args_per_field) - 1;
             continue;
         } else if (!strcasecmp(c->argv[i]->ptr, "EX")) {
@@ -2908,6 +2908,9 @@ void hdelCommand(client *c) {
         checkType(c,o,OBJ_HASH)) return;
 
     int64_t oldLen = (int64_t) hashTypeLength(o, 0);
+    if (server.memory_tracking_per_slot)
+        oldsize = hashTypeAllocSize(o);
+
     /* Hash field expiration is optimized to avoid frequent update global HFE DS for
      * each field deletion. Eventually active-expiration will run and update or remove
      * the hash from global HFE DS gracefully. Nevertheless, statistic "subexpiry"
@@ -3535,6 +3538,7 @@ static ExpireAction onFieldExpire(eItem item, void *ctx) {
     /* update keysizes */
     unsigned long l = hashTypeLength(expCtx->hashObj, 0);
     updateKeysizesHist(expCtx->db, getKeySlot(key), OBJ_HASH, l, l - 1);
+
     serverAssert(hashTypeDelete(expCtx->hashObj, hf, 0) == 1);
     if (server.memory_tracking_per_slot)
         updateSlotAllocSize(expCtx->db, getKeySlot(key), oldsize, hashTypeAllocSize(kv));
@@ -3575,7 +3579,8 @@ typedef struct {
 /* Parser for HEXPIRE family commands with flexible keyword ordering.
  * Returns C_OK on success, C_ERR on error (with reply sent). */
 static int parseHashCommandArgs(client *c, HashCommandArgs *args,
-                                long long basetime, int unit) {
+                                long long basetime, int unit)
+{
     memset(args, 0, sizeof(*args));
     args->fieldsPos = -1;
     args->expireTimePos = -1;
@@ -3652,11 +3657,13 @@ static int parseHashCommandArgs(client *c, HashCommandArgs *args,
 }
 
 /* HTTL key <FIELDS count field [field ...]>  */
-static void httlGenericCommand(client *c, const char *cmd, long long basetime, int unit) {
+static void httlGenericCommand(client *c, const char *cmd, long long basetime, int unit)
+{
     UNUSED(cmd);
     kvobj *hashObj;
     long numFields = 0, numFieldsAt = 3;
 
+    /* Read the hash object */
     hashObj = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c, hashObj, OBJ_HASH))
         return;
@@ -3666,15 +3673,19 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
         return;
     }
 
+    /* Read number of fields */
     if (getRangeLongFromObjectOrReply(c, c->argv[numFieldsAt], 1, LONG_MAX,
                                       &numFields, "Number of fields must be a positive integer") != C_OK)
         return;
 
+    /* Verify `numFields` is consistent with number of arguments */
     if (numFields != (c->argc - numFieldsAt - 1)) {
         addReplyError(c, "The `numfields` parameter must match the number of arguments");
         return;
     }
 
+    /* Non-existing keys and empty hashes are the same thing. It also means
+     * fields in the command don't exist in the hash key. */
     if (!hashObj) {
         addReplyArrayLen(c, numFields);
         for (int i = 0; i < numFields; i++) {
@@ -3806,7 +3817,8 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
  *   not met, then command will be rejected. Otherwise, EXPIRE command will be
  *   propagated for given key.
  */
-static void hexpireGenericCommand(client *c, long long basetime, int unit) {
+static void hexpireGenericCommand(client *c, long long basetime, int unit)
+{
     HashCommandArgs args;
     int fieldsNotSet = 0, updated = 0, deleted = 0;
     int64_t oldlen, newlen;
@@ -3840,7 +3852,7 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
     addReplyArrayLen(c, args.fieldCount);
 
     /* Collect positions of fields that need to be removed from propagation */
-    int fieldsToRemove[args.fieldCount > 0 ? args.fieldCount : 1];  /* Avoid zero-length array */
+    int *fieldsToRemove = zmalloc(sizeof(int) * (args.fieldCount > 0 ? args.fieldCount : 1));
     int removeCount = 0;
 
     for (int i = 0; i < args.fieldCount; i++) {
@@ -3895,8 +3907,8 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
         return;
     }
 
-    /* Handle propagation using command rewriting */
-    /* Rewrite to canonical HPEXPIREAT command */
+    /* Handle propagation using command rewriting
+       Rewrite to canonical HPEXPIREAT command */
     if (c->cmd->proc != hpexpireatCommand) {
         rewriteClientCommandArgument(c, 0, shared.hpexpireat);
 
@@ -3914,6 +3926,8 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
         rewriteClientCommandArgument(c, args.fieldsPos + 1, newFieldCount);
         decrRefCount(newFieldCount);
     }
+
+    zfree(fieldsToRemove);
 }
 
 /* HPEXPIRE key milliseconds [ NX | XX | GT | LT] FIELDS numfields <field [field ...]> */
@@ -3984,7 +3998,7 @@ void hpersistCommand(client *c) {
     }
 
     /* Non-existing keys and empty hashes are the same thing. It also means
-     * fields in the command don't exist in the hash key. */
+       fields in the command don't exist in the hash key. */
     if (!hashObj) {
         addReplyArrayLen(c, numFields);
         for (int i = 0; i < numFields; i++) {
