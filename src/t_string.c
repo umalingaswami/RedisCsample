@@ -436,6 +436,14 @@ int getGenericCommand(client *c) {
     if (checkType(c,o,OBJ_STRING)) {
         return C_ERR;
     }
+	if (sdsEncodedObject(o)) {
+		size_t len = sdslen(o->ptr);
+		if (shouldSendObjectByReference(o->type, len)) {
+			sendByReference(c, o->ptr, len, o);
+			return C_OK;
+		}						
+	} 
+		
 
     addReplyBulk(c,o);
     return C_OK;
@@ -486,7 +494,6 @@ void getexCommand(client *c) {
     if (args.expire && getExpireMillisecondsOrReply(c, args.expire, args.flags, args.unit, &milliseconds) != C_OK) {
         return;
     }
-
     /* We need to do this before we expire the key or delete it */
     addReplyBulk(c,o);
 
@@ -649,10 +656,16 @@ void getrangeCommand(client *c) {
 
     /* Precondition: end >= 0 && end < strlen, so the only condition where
      * nothing can be returned is: start > end. */
+	
     if (start > end || strlen == 0) {
         addReply(c,shared.emptybulk);
     } else {
-        addReplyBulkCBuffer(c,(char*)str+start,end-start+1);
+		size_t len = end-start+1;
+		if (shouldSendObjectByReference(o->type, len)) {
+			sendByReference(c, (char*)str+start,  len, o);
+		} else {			
+			addReplyBulkCBuffer(c,(char*)str+start, len);
+		}
     }
 }
 
